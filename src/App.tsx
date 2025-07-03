@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useResponsiveDesign } from './hooks/useResponsiveDesign';
 import { useHapticFeedback } from './hooks/useHapticFeedback';
 import { useGestureControls } from './hooks/useGestureControls';
+import { ToastContainer, useToast } from './components/ToastNotification';
+import ErrorBoundary from './components/ErrorBoundary';
 import ResponsiveLayout from './components/ResponsiveLayout';
 import ChatInterface from './components/ChatInterface';
 import PersonalitySelector from './components/PersonalitySelector';
@@ -11,8 +13,19 @@ import AdvancedEmotionDashboard from './components/AdvancedEmotionDashboard';
 import SmartWellnessSystem from './components/SmartWellnessSystem';
 import ConversationHistory from './components/ConversationHistory';
 import { conversationManager } from './services/conversationManager';
+import { isOpenAIConfigured } from './services/openai';
 import { AIPersonality, VoiceSettings as VoiceSettingsType, Message, Conversation, UserPreferences } from './types';
 import './styles/responsive.css';
+
+// Loading component
+const LoadingSpinner = () => (
+  <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center">
+    <div className="text-center">
+      <div className="w-16 h-16 border-4 border-yellow-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+      <p className="text-gray-600 dark:text-gray-400">Loading VoiceInsight...</p>
+    </div>
+  </div>
+);
 
 const AI_PERSONALITIES: AIPersonality[] = [
   {
@@ -69,6 +82,7 @@ const DEFAULT_PREFERENCES: UserPreferences = {
 function App() {
   const { deviceInfo, config, isCompact, isMobile, isTablet } = useResponsiveDesign();
   const { triggerHaptic } = useHapticFeedback();
+  const { toasts, removeToast, error: showError, warning, info } = useToast();
   
   const [currentView, setCurrentView] = useState<'chat' | 'dashboard' | 'wellness' | 'history' | 'settings'>('chat');
   const [preferences, setPreferences] = useState<UserPreferences>(DEFAULT_PREFERENCES);
@@ -77,6 +91,7 @@ function App() {
   const [currentEmotion, setCurrentEmotion] = useState<string>();
   const [currentSentiment, setCurrentSentiment] = useState<number>();
   const [emotionHistory, setEmotionHistory] = useState<Array<{ emotion: string; timestamp: Date; intensity: number }>>([]);
+  const [isLoading, setIsLoading] = useState(true);
 
   // Gesture controls for navigation
   const { gestureProps } = useGestureControls({
@@ -101,114 +116,180 @@ function App() {
   });
 
   useEffect(() => {
-    // Load preferences from localStorage
-    const savedPreferences = localStorage.getItem('userPreferences');
-    if (savedPreferences) {
+    const initializeApp = async () => {
       try {
-        const parsed = JSON.parse(savedPreferences);
-        setPreferences({ ...DEFAULT_PREFERENCES, ...parsed });
+        // Check if OpenAI is configured
+        if (!isOpenAIConfigured()) {
+          warning(
+            'OpenAI Not Configured',
+            'AI responses will use fallback mode. Please configure your OpenAI API key for full functionality.'
+          );
+        }
+
+        // Load preferences from localStorage
+        const savedPreferences = localStorage.getItem('userPreferences');
+        if (savedPreferences) {
+          try {
+            const parsed = JSON.parse(savedPreferences);
+            setPreferences({ ...DEFAULT_PREFERENCES, ...parsed });
+          } catch (error) {
+            console.error('Error loading preferences:', error);
+            showError('Settings Error', 'Failed to load your preferences. Using defaults.');
+          }
+        }
+
+        // Load emotion history
+        const savedEmotionHistory = localStorage.getItem('emotionHistory');
+        if (savedEmotionHistory) {
+          try {
+            const parsed = JSON.parse(savedEmotionHistory).map((item: any) => ({
+              ...item,
+              timestamp: new Date(item.timestamp)
+            }));
+            setEmotionHistory(parsed);
+          } catch (error) {
+            console.error('Error loading emotion history:', error);
+          }
+        }
+
+        // Load conversations
+        loadConversations();
+
+        // Create initial conversation if none exists
+        const existing = conversationManager.getCurrentConversation();
+        if (!existing) {
+          const newConversation = conversationManager.createConversation();
+          setCurrentConversation(newConversation);
+        } else {
+          setCurrentConversation(existing);
+        }
+
+        // Apply emotion-based theming
+        if (currentEmotion) {
+          document.documentElement.className = `emotion-${currentEmotion}`;
+        }
+
+        // Show welcome message for new users
+        const isFirstVisit = !localStorage.getItem('hasVisited');
+        if (isFirstVisit) {
+          localStorage.setItem('hasVisited', 'true');
+          info(
+            'Welcome to VoiceInsight!',
+            'Start by recording your voice to analyze emotions and get AI-powered insights.',
+            { duration: 8000 }
+          );
+        }
+
       } catch (error) {
-        console.error('Error loading preferences:', error);
+        console.error('Error initializing app:', error);
+        showError('Initialization Error', 'Failed to initialize the application properly.');
+      } finally {
+        setIsLoading(false);
       }
-    }
+    };
 
-    // Load emotion history
-    const savedEmotionHistory = localStorage.getItem('emotionHistory');
-    if (savedEmotionHistory) {
-      try {
-        const parsed = JSON.parse(savedEmotionHistory).map((item: any) => ({
-          ...item,
-          timestamp: new Date(item.timestamp)
-        }));
-        setEmotionHistory(parsed);
-      } catch (error) {
-        console.error('Error loading emotion history:', error);
-      }
-    }
-
-    // Load conversations
-    loadConversations();
-
-    // Create initial conversation if none exists
-    const existing = conversationManager.getCurrentConversation();
-    if (!existing) {
-      const newConversation = conversationManager.createConversation();
-      setCurrentConversation(newConversation);
-    } else {
-      setCurrentConversation(existing);
-    }
-
-    // Apply emotion-based theming
-    if (currentEmotion) {
-      document.documentElement.className = `emotion-${currentEmotion}`;
-    }
-  }, [currentEmotion]);
+    initializeApp();
+  }, [currentEmotion, showError, warning, info]);
 
   const loadConversations = () => {
-    const allConversations = conversationManager.getConversations();
-    setConversations(allConversations);
+    try {
+      const allConversations = conversationManager.getConversations();
+      setConversations(allConversations);
+    } catch (error) {
+      console.error('Error loading conversations:', error);
+      showError('Data Error', 'Failed to load conversation history.');
+    }
   };
 
   const savePreferences = (newPreferences: UserPreferences) => {
-    setPreferences(newPreferences);
-    localStorage.setItem('userPreferences', JSON.stringify(newPreferences));
+    try {
+      setPreferences(newPreferences);
+      localStorage.setItem('userPreferences', JSON.stringify(newPreferences));
+    } catch (error) {
+      console.error('Error saving preferences:', error);
+      showError('Save Error', 'Failed to save your preferences.');
+    }
   };
 
   const saveEmotionHistory = (history: Array<{ emotion: string; timestamp: Date; intensity: number }>) => {
-    setEmotionHistory(history);
-    localStorage.setItem('emotionHistory', JSON.stringify(history));
+    try {
+      setEmotionHistory(history);
+      localStorage.setItem('emotionHistory', JSON.stringify(history));
+    } catch (error) {
+      console.error('Error saving emotion history:', error);
+    }
   };
 
   const handleNewMessage = (message: Message) => {
-    if (message.processingResult?.emotions) {
-      const emotion = message.processingResult.emotions.primary_emotion;
-      setCurrentEmotion(emotion);
+    try {
+      if (message.processingResult?.emotions) {
+        const emotion = message.processingResult.emotions.primary_emotion;
+        setCurrentEmotion(emotion);
+        
+        // Add to emotion history
+        const newEntry = {
+          emotion,
+          timestamp: new Date(),
+          intensity: message.processingResult.emotions.confidence
+        };
+        
+        const updatedHistory = [...emotionHistory, newEntry].slice(-100); // Keep last 100 entries
+        saveEmotionHistory(updatedHistory);
+      }
       
-      // Add to emotion history
-      const newEntry = {
-        emotion,
-        timestamp: new Date(),
-        intensity: message.processingResult.emotions.confidence
-      };
+      if (message.processingResult?.sentiment_confidence) {
+        const sentimentValue = message.processingResult.sentiment === 'positive' ? 1 : 
+                              message.processingResult.sentiment === 'negative' ? -1 : 0;
+        setCurrentSentiment(sentimentValue * message.processingResult.sentiment_confidence);
+      }
       
-      const updatedHistory = [...emotionHistory, newEntry].slice(-100); // Keep last 100 entries
-      saveEmotionHistory(updatedHistory);
+      loadConversations();
+      triggerHaptic('light');
+    } catch (error) {
+      console.error('Error handling new message:', error);
+      showError('Message Error', 'Failed to process the message properly.');
     }
-    
-    if (message.processingResult?.sentiment_confidence) {
-      const sentimentValue = message.processingResult.sentiment === 'positive' ? 1 : 
-                            message.processingResult.sentiment === 'negative' ? -1 : 0;
-      setCurrentSentiment(sentimentValue * message.processingResult.sentiment_confidence);
-    }
-    
-    loadConversations();
-    triggerHaptic('light');
   };
 
   const handleConversationSelect = (conversation: Conversation) => {
-    conversationManager.setCurrentConversation(conversation.id);
-    setCurrentConversation(conversation);
-    setCurrentView('chat');
-    triggerHaptic('medium');
+    try {
+      conversationManager.setCurrentConversation(conversation.id);
+      setCurrentConversation(conversation);
+      setCurrentView('chat');
+      triggerHaptic('medium');
+    } catch (error) {
+      console.error('Error selecting conversation:', error);
+      showError('Navigation Error', 'Failed to open the selected conversation.');
+    }
   };
 
   const handleConversationDelete = (conversationId: string) => {
-    conversationManager.deleteConversation(conversationId);
-    loadConversations();
-    
-    if (currentConversation?.id === conversationId) {
-      const newConversation = conversationManager.createConversation();
-      setCurrentConversation(newConversation);
+    try {
+      conversationManager.deleteConversation(conversationId);
+      loadConversations();
+      
+      if (currentConversation?.id === conversationId) {
+        const newConversation = conversationManager.createConversation();
+        setCurrentConversation(newConversation);
+      }
+      triggerHaptic('heavy');
+    } catch (error) {
+      console.error('Error deleting conversation:', error);
+      showError('Delete Error', 'Failed to delete the conversation.');
     }
-    triggerHaptic('heavy');
   };
 
   const handleNewConversation = () => {
-    const newConversation = conversationManager.createConversation();
-    setCurrentConversation(newConversation);
-    loadConversations();
-    setCurrentView('chat');
-    triggerHaptic('medium');
+    try {
+      const newConversation = conversationManager.createConversation();
+      setCurrentConversation(newConversation);
+      loadConversations();
+      setCurrentView('chat');
+      triggerHaptic('medium');
+    } catch (error) {
+      console.error('Error creating new conversation:', error);
+      showError('Creation Error', 'Failed to create a new conversation.');
+    }
   };
 
   const handleViewChange = (view: string) => {
@@ -219,201 +300,212 @@ function App() {
   const selectedPersonality = AI_PERSONALITIES.find(p => p.id === preferences.aiPersonality) || AI_PERSONALITIES[0];
   const emotionalInsights = conversationManager.getEmotionalInsights(7);
 
+  if (isLoading) {
+    return <LoadingSpinner />;
+  }
+
   return (
-    <div 
-      className={`min-h-screen transition-colors duration-500 ${
-        currentEmotion ? `emotion-${currentEmotion}` : ''
-      }`}
-      {...gestureProps}
-    >
-      <ResponsiveLayout
-        currentView={currentView}
-        onViewChange={handleViewChange}
-        onNewConversation={handleNewConversation}
+    <ErrorBoundary>
+      <div 
+        className={`min-h-screen transition-colors duration-500 ${
+          currentEmotion ? `emotion-${currentEmotion}` : ''
+        }`}
+        {...gestureProps}
       >
-        <AnimatePresence mode="wait">
-          {currentView === 'chat' && (
-            <motion.div
-              key="chat"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              className="h-full"
-            >
-              <ChatInterface
-                personality={selectedPersonality}
-                autoSpeak={preferences.autoSpeak}
-                voiceSettings={preferences.voiceSettings}
-                onNewMessage={handleNewMessage}
-              />
-            </motion.div>
-          )}
-
-          {currentView === 'dashboard' && (
-            <motion.div
-              key="dashboard"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-            >
-              <AdvancedEmotionDashboard
-                insights={emotionalInsights}
-                currentEmotion={currentEmotion}
-                currentSentiment={currentSentiment}
-                emotionHistory={emotionHistory}
-              />
-            </motion.div>
-          )}
-
-          {currentView === 'wellness' && (
-            <motion.div
-              key="wellness"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-            >
-              <SmartWellnessSystem
-                currentEmotion={currentEmotion}
-                sentimentScore={currentSentiment}
-                emotionHistory={emotionHistory}
-              />
-            </motion.div>
-          )}
-
-          {currentView === 'history' && (
-            <motion.div
-              key="history"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-            >
-              <ConversationHistory
-                conversations={conversations}
-                currentConversationId={currentConversation?.id}
-                onConversationSelect={handleConversationSelect}
-                onConversationDelete={handleConversationDelete}
-              />
-            </motion.div>
-          )}
-
-          {currentView === 'settings' && (
-            <motion.div
-              key="settings"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              className="space-y-8"
-            >
-              <h2 className="text-2xl font-bold text-gray-800 dark:text-white">Settings</h2>
-              
-              <div className={`grid gap-8 ${
-                config.emotionDisplayStyle === 'dashboard' 
-                  ? 'grid-cols-1 lg:grid-cols-2' 
-                  : 'grid-cols-1'
-              }`}>
-                <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
-                  <PersonalitySelector
-                    personalities={AI_PERSONALITIES}
-                    selectedPersonality={selectedPersonality}
-                    onPersonalityChange={(personality) => 
-                      savePreferences({ ...preferences, aiPersonality: personality.id })
-                    }
+        <ResponsiveLayout
+          currentView={currentView}
+          onViewChange={handleViewChange}
+          onNewConversation={handleNewConversation}
+        >
+          <Suspense fallback={<LoadingSpinner />}>
+            <AnimatePresence mode="wait">
+              {currentView === 'chat' && (
+                <motion.div
+                  key="chat"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                  className="h-full"
+                >
+                  <ChatInterface
+                    personality={selectedPersonality}
+                    autoSpeak={preferences.autoSpeak}
+                    voiceSettings={preferences.voiceSettings}
+                    onNewMessage={handleNewMessage}
                   />
-                </div>
-                
-                <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
-                  <VoiceSettings
-                    settings={preferences.voiceSettings}
-                    onSettingsChange={(voiceSettings) =>
-                      savePreferences({ ...preferences, voiceSettings })
-                    }
+                </motion.div>
+              )}
+
+              {currentView === 'dashboard' && (
+                <motion.div
+                  key="dashboard"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                >
+                  <AdvancedEmotionDashboard
+                    insights={emotionalInsights}
+                    currentEmotion={currentEmotion}
+                    currentSentiment={currentSentiment}
+                    emotionHistory={emotionHistory}
                   />
-                </div>
-              </div>
+                </motion.div>
+              )}
 
-              <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
-                <h3 className="text-lg font-medium text-gray-800 dark:text-white mb-4">General Settings</h3>
-                
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                      Auto-speak AI responses
-                    </label>
-                    <button
-                      onClick={() => {
-                        savePreferences({ ...preferences, autoSpeak: !preferences.autoSpeak });
-                        triggerHaptic('light');
-                      }}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                        preferences.autoSpeak ? 'bg-blue-600' : 'bg-gray-200 dark:bg-gray-700'
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                          preferences.autoSpeak ? 'translate-x-6' : 'translate-x-1'
-                        }`}
+              {currentView === 'wellness' && (
+                <motion.div
+                  key="wellness"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                >
+                  <SmartWellnessSystem
+                    currentEmotion={currentEmotion}
+                    sentimentScore={currentSentiment}
+                    emotionHistory={emotionHistory}
+                  />
+                </motion.div>
+              )}
+
+              {currentView === 'history' && (
+                <motion.div
+                  key="history"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                >
+                  <ConversationHistory
+                    conversations={conversations}
+                    currentConversationId={currentConversation?.id}
+                    onConversationSelect={handleConversationSelect}
+                    onConversationDelete={handleConversationDelete}
+                  />
+                </motion.div>
+              )}
+
+              {currentView === 'settings' && (
+                <motion.div
+                  key="settings"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                  className="space-y-8"
+                >
+                  <h2 className="text-2xl font-bold text-gray-800 dark:text-white">Settings</h2>
+                  
+                  <div className={`grid gap-8 ${
+                    config.emotionDisplayStyle === 'dashboard' 
+                      ? 'grid-cols-1 lg:grid-cols-2' 
+                      : 'grid-cols-1'
+                  }`}>
+                    <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
+                      <PersonalitySelector
+                        personalities={AI_PERSONALITIES}
+                        selectedPersonality={selectedPersonality}
+                        onPersonalityChange={(personality) => 
+                          savePreferences({ ...preferences, aiPersonality: personality.id })
+                        }
                       />
-                    </button>
-                  </div>
-
-                  <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                      Show emotion charts
-                    </label>
-                    <button
-                      onClick={() => {
-                        savePreferences({ ...preferences, showEmotionCharts: !preferences.showEmotionCharts });
-                        triggerHaptic('light');
-                      }}
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                        preferences.showEmotionCharts ? 'bg-blue-600' : 'bg-gray-200 dark:bg-gray-700'
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                          preferences.showEmotionCharts ? 'translate-x-6' : 'translate-x-1'
-                        }`}
+                    </div>
+                    
+                    <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
+                      <VoiceSettings
+                        settings={preferences.voiceSettings}
+                        onSettingsChange={(voiceSettings) =>
+                          savePreferences({ ...preferences, voiceSettings })
+                        }
                       />
-                    </button>
+                    </div>
                   </div>
-                </div>
-              </div>
 
-              {/* Device Information */}
-              <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
-                <h3 className="text-lg font-medium text-gray-800 dark:text-white mb-4">Device Information</h3>
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div>
-                    <span className="text-gray-500 dark:text-gray-400">Device Type:</span>
-                    <span className="ml-2 font-medium text-gray-800 dark:text-white capitalize">
-                      {deviceInfo.type}
-                    </span>
+                  <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
+                    <h3 className="text-lg font-medium text-gray-800 dark:text-white mb-4">General Settings</h3>
+                    
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                          Auto-speak AI responses
+                        </label>
+                        <button
+                          onClick={() => {
+                            savePreferences({ ...preferences, autoSpeak: !preferences.autoSpeak });
+                            triggerHaptic('light');
+                          }}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            preferences.autoSpeak ? 'bg-blue-600' : 'bg-gray-200 dark:bg-gray-700'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              preferences.autoSpeak ? 'translate-x-6' : 'translate-x-1'
+                            }`}
+                          />
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                          Show emotion charts
+                        </label>
+                        <button
+                          onClick={() => {
+                            savePreferences({ ...preferences, showEmotionCharts: !preferences.showEmotionCharts });
+                            triggerHaptic('light');
+                          }}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            preferences.showEmotionCharts ? 'bg-blue-600' : 'bg-gray-200 dark:bg-gray-700'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              preferences.showEmotionCharts ? 'translate-x-6' : 'translate-x-1'
+                            }`}
+                          />
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <span className="text-gray-500 dark:text-gray-400">Screen Size:</span>
-                    <span className="ml-2 font-medium text-gray-800 dark:text-white">
-                      {deviceInfo.viewportWidth}×{deviceInfo.viewportHeight}
-                    </span>
+
+                  {/* Device Information */}
+                  <div className="bg-white/10 dark:bg-black/10 backdrop-blur-lg rounded-lg p-6 border border-white/20 dark:border-gray-800/50">
+                    <h3 className="text-lg font-medium text-gray-800 dark:text-white mb-4">Device Information</h3>
+                    <div className="grid grid-cols-2 gap-4 text-sm">
+                      <div>
+                        <span className="text-gray-500 dark:text-gray-400">Device Type:</span>
+                        <span className="ml-2 font-medium text-gray-800 dark:text-white capitalize">
+                          {deviceInfo.type}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500 dark:text-gray-400">Screen Size:</span>
+                        <span className="ml-2 font-medium text-gray-800 dark:text-white">
+                          {deviceInfo.viewportWidth}×{deviceInfo.viewportHeight}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500 dark:text-gray-400">Touch Capable:</span>
+                        <span className="ml-2 font-medium text-gray-800 dark:text-white">
+                          {deviceInfo.touchCapable ? 'Yes' : 'No'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500 dark:text-gray-400">Foldable:</span>
+                        <span className="ml-2 font-medium text-gray-800 dark:text-white">
+                          {deviceInfo.isFoldable ? 'Yes' : 'No'}
+                        </span>
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <span className="text-gray-500 dark:text-gray-400">Touch Capable:</span>
-                    <span className="ml-2 font-medium text-gray-800 dark:text-white">
-                      {deviceInfo.touchCapable ? 'Yes' : 'No'}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-gray-500 dark:text-gray-400">Foldable:</span>
-                    <span className="ml-2 font-medium text-gray-800 dark:text-white">
-                      {deviceInfo.isFoldable ? 'Yes' : 'No'}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </ResponsiveLayout>
-    </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </Suspense>
+        </ResponsiveLayout>
+
+        {/* Toast Notifications */}
+        <ToastContainer toasts={toasts} onRemove={removeToast} />
+      </div>
+    </ErrorBoundary>
   );
 }
 
